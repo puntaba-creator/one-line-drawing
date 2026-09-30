@@ -1,11 +1,12 @@
 // 重い計算（点のサンプリングと経路最適化）を UI スレッドから切り離す
 import { generateOneStroke } from './lib/onestroke.js';
+import { stylize } from './lib/handdrawn.js';
 
 self.onmessage = (e) => {
-  const { id, image, options } = e.data;
+  const { id, image, options, style } = e.data;
   try {
     let last = 0;
-    const res = generateOneStroke(image, {
+    const raw = generateOneStroke(image, {
       ...options,
       onProgress(stage, ratio) {
         const now = Date.now();
@@ -15,6 +16,8 @@ self.onmessage = (e) => {
         }
       },
     });
+    self.postMessage({ id, type: 'progress', stage: 'hand', ratio: null });
+    const res = stylize(raw, { ...style, noCross: options.noCross });
     self.postMessage({ id, type: 'result', result: res }, [res.points.buffer]);
   } catch (err) {
     self.postMessage({ id, type: 'error', message: String(err?.message || err) });

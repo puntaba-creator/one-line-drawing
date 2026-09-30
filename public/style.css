@@ -162,3 +162,4 @@ input[type="color"] { width: 36px; height: 28px; border: 1px solid var(--line); 
 .check-field input { margin-top: 5px; accent-color: var(--accent); }
 .check-field > span { flex-direction: column; justify-content: flex-start; }
 .check-field small { font-weight: 400; color: var(--ink-soft); font-size: .78rem; }
+.field-help { color: var(--ink-soft); font-size: .78rem; }

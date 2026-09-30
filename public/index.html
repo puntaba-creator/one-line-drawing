@@ -90,11 +90,25 @@
         </label>
         <label class="field range">
           <span>なめらかさ <output id="smooth-out"></output></span>
-          <input type="range" id="smooth" min="0" max="1" step="0.05" value="0.6">
+          <input type="range" id="smooth" min="0" max="1" step="0.05" value="0.5">
+        </label>
+        <label class="field range">
+          <span>手書き感 <output id="hand-out"></output></span>
+          <input type="range" id="hand" min="0" max="1" step="0.05" value="0.5">
+          <small class="field-help">線にゆっくりした手のゆらぎを加えます</small>
+        </label>
+        <label class="field range">
+          <span>線どうしのすき間 <output id="gap-out"></output></span>
+          <input type="range" id="gap" min="0" max="6" step="0.25" value="2">
+          <small class="field-help">近づきすぎた線を、このすき間まで押し広げます（0 で無効）</small>
         </label>
         <label class="field range">
           <span>線の太さ <output id="width-out"></output></span>
           <input type="range" id="stroke-width" min="0.5" max="6" step="0.1" value="1.6">
+        </label>
+        <label class="field check-field">
+          <input type="checkbox" id="pressure" checked>
+          <span>筆圧で太さに強弱をつける<small>曲がるところは太く、速い直線と描き始め・終わりは細く</small></span>
         </label>
         <div class="field colors">
           <label>線の色 <input type="color" id="stroke-color" value="#1f1d1a"></label>

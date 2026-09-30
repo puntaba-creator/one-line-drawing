@@ -1,4 +1,4 @@
-import { toSvg, safeTensions } from './lib/onestroke.js';
+import { toHandSvg } from './lib/handdrawn.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,7 +23,6 @@ const FONTS = {
 const state = {
   source: null, // { width, height, data } 解析用の画像
   result: null, // 一筆書きの点列
-  tensions: null, // 交差しない曲線にするための区間ごとの曲がり具合 { smooth, values }
   jobId: 0,
 };
 
@@ -35,11 +34,10 @@ worker.onmessage = (e) => {
   const msg = e.data;
   if (msg.id !== state.jobId) return; // 古いジョブの結果は捨てる
   if (msg.type === 'progress') {
-    const label = { analyze: '画像を解析中…', sample: '線をたどる点を配置中…', route: '一本の線でつなぎ中…', uncross: '交差をほどいています…', done: '仕上げ中…' }[msg.stage];
+    const label = { analyze: '画像を解析中…', sample: '線をたどる点を配置中…', route: '一本の線でつなぎ中…', uncross: '交差をほどいています…', done: '仕上げ中…', hand: '手描きの風合いに仕上げ中…' }[msg.stage];
     setBusy(label, msg.stage === 'route' ? msg.ratio : null);
   } else if (msg.type === 'result') {
     state.result = { ...msg.result, noCross: settings().noCross };
-    state.tensions = null;
     setBusy(null);
     render(true);
   } else if (msg.type === 'error') {
@@ -55,6 +53,9 @@ function settings() {
     maxPoints: Number($('detail').value),
     threshold: Number($('threshold').value),
     smooth: Number($('smooth').value),
+    hand: Number($('hand').value),
+    gap: Number($('gap').value),
+    pressure: $('pressure').checked,
     strokeWidth: Number($('stroke-width').value),
     stroke: $('stroke-color').value,
     background: $('bg-transparent').checked ? 'transparent' : $('bg-color').value,
@@ -80,26 +81,23 @@ function generate() {
       // 点が多いほど経路最適化に時間をかける
       optimizeMs: Math.min(4000, 600 + s.maxPoints * 0.4),
     },
+    style: { smooth: s.smooth, hand: s.hand, gap: s.gap, strokeWidth: s.strokeWidth, seed: 1 },
   }, [image.data.buffer]);
 }
 
 // ---------------------------------------------------------------------------
 // 描画
 
-function buildSvg() {
+function buildSvg(animated = false) {
   const s = settings();
-  const r = state.result;
-  // 曲線化で生まれる交差を避ける（なめらかさが変わったときだけ計算し直す）
-  if (r.noCross && s.smooth > 0 && state.tensions?.smooth !== s.smooth) {
-    state.tensions = { smooth: s.smooth, values: safeTensions(r.points, r.count, s.smooth, OUTPUT_SCALE) };
-  }
-  return toSvg(r, {
-    tensions: r.noCross && s.smooth > 0 ? state.tensions.values : null,
+  return toHandSvg(state.result, {
     scale: OUTPUT_SCALE,
-    smooth: s.smooth,
     stroke: s.stroke,
-    strokeWidth: s.strokeWidth * OUTPUT_SCALE,
+    strokeWidth: s.strokeWidth,
     background: s.background,
+    // 筆圧の強さ: 手書き感が強いほど強弱も大きく
+    pressure: s.pressure ? 0.4 + 0.6 * s.hand : 0,
+    animated,
   });
 }
 
@@ -115,15 +113,15 @@ function render(animate = false) {
     return;
   }
   // buildSvg は数値と検証済みの色だけから組み立てるので innerHTML で安全
-  $('svg-holder').innerHTML = buildSvg();
+  $('svg-holder').innerHTML = buildSvg(true);
   const ratio = r.length / r.width;
-  $('stats').textContent = `${r.count.toLocaleString()} 点を${r.noCross ? '交差なしの' : ''} 1 本の線でつなぎました（線の長さは画像の幅の約 ${Math.round(ratio)} 倍）`;
+  $('stats').textContent = `${(r.sourceCount ?? r.count).toLocaleString()} 点を${r.noCross ? '交差なしの' : ''} 1 本の線でつなぎました（線の長さは画像の幅の約 ${Math.round(ratio)} 倍）`;
   setActions(true);
   if (animate) playDrawing();
 }
 
 function playDrawing() {
-  const path = $('svg-holder').querySelector('path');
+  const path = $('svg-holder').querySelector('path.draw');
   if (!path) return;
   if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const len = path.getTotalLength();
@@ -188,6 +186,7 @@ async function loadImageFile(file) {
     showError('画像ファイルを選んでください。');
     return;
   }
+  setMode('edges'); // 写真は輪郭をなぞるのが基本
   try {
     const bitmap = await createImageBitmap(file);
     useCanvas(drawableToCanvas(bitmap, bitmap.width, bitmap.height, null));
@@ -335,7 +334,9 @@ $('no-cross').addEventListener('change', generate);
 $('threshold').addEventListener('input', regenerate);
 
 // 見た目だけの設定（再計算なし）
-for (const id of ['smooth', 'stroke-width', 'stroke-color', 'bg-color', 'bg-transparent']) {
+// 線の形が変わる設定（少し待ってから再計算）
+for (const id of ['smooth', 'hand', 'gap', 'stroke-width']) $(id).addEventListener('input', regenerate);
+for (const id of ['pressure', 'stroke-color', 'bg-color', 'bg-transparent']) {
   $(id).addEventListener('input', () => render(false));
 }
 
@@ -344,6 +345,8 @@ function syncOutputs() {
   $('threshold-out').textContent = Number($('threshold').value).toFixed(2);
   $('smooth-out').textContent = Number($('smooth').value).toFixed(2);
   $('width-out').textContent = Number($('stroke-width').value).toFixed(1);
+  $('hand-out').textContent = Number($('hand').value).toFixed(2);
+  $('gap-out').textContent = Number($('gap').value) === 0 ? 'なし' : Number($('gap').value).toFixed(2);
 }
 document.querySelector('.settings').addEventListener('input', syncOutputs);
 syncOutputs();
