@@ -33,16 +33,33 @@ function noise1d(seed, size = 4096) {
   };
 }
 
-/** 折れ線を間隔 step で打ち直す。元の頂点は必ず残すので形（交差のなさ）は変わらない。 */
-export function resample(points, count, step) {
+/**
+ * 折れ線を間隔 step で打ち直す。元の頂点は必ず残すので形（交差のなさ）は変わらない。
+ * mobility（各点の動かしやすさ 0..1）も返す: 長いつなぎ線の途中は 1、形をなす線の上は低い。
+ */
+export function resample(points, count, step, { stiffness = 0.15 } = {}) {
+  // 元の区間の長さの中央値 ＝ 形をなす線での点の間隔。その数倍より長い区間は「つなぎ線」
+  const lens = [];
+  for (let i = 0; i + 1 < count; i++) lens.push(Math.hypot(points[i * 2 + 2] - points[i * 2], points[i * 2 + 3] - points[i * 2 + 1]));
+  const sorted = lens.slice().sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] || step;
+  const connector = Math.max(median * 3, step * 3);
   const out = [points[0], points[1]];
+  const mob = [stiffness];
   for (let i = 0; i + 1 < count; i++) {
     const x0 = points[i * 2], y0 = points[i * 2 + 1], x1 = points[i * 2 + 2], y1 = points[i * 2 + 3];
-    const len = Math.hypot(x1 - x0, y1 - y0);
-    const k = Math.max(1, Math.round(len / step));
-    for (let s = 1; s <= k; s++) out.push(x0 + ((x1 - x0) * s) / k, y0 + ((y1 - y0) * s) / k);
+    const k = Math.max(1, Math.round(lens[i] / step));
+    const isConnector = lens[i] > connector;
+    for (let s = 1; s <= k; s++) {
+      out.push(x0 + ((x1 - x0) * s) / k, y0 + ((y1 - y0) * s) / k);
+      // つなぎ線の両端（形の上の点）は固く、途中ほど動きやすく
+      const edge = Math.min(s, k - s) * step;
+      mob.push(isConnector && s < k ? stiffness + (1 - stiffness) * Math.min(1, edge / (step * 4)) : stiffness);
+    }
   }
-  return new Float32Array(out);
+  const res = new Float32Array(out);
+  res.mobility = Float32Array.from(mob);
+  return res;
 }
 
 /** 各点の法線（前後の点から求める単位ベクトル）。 */
@@ -66,10 +83,12 @@ const FALLOFF = 8;
 function applyWithoutCrossing(p, next, n, guard) {
   if (!guard) { p.set(next); return; }
   const prev = p.slice();
+  // 動かす前からあった交わり（入力由来）は対象外。動かしたことで新たに生じたものだけ戻す
+  const baseline = new Set(crossingPairs(prev, n).map(([a, b]) => a * n + b));
   p.set(next);
   const keep = new Float32Array(n).fill(1); // 1: next のまま、0: prev に戻す
   for (let round = 0; round < 60; round++) {
-    const pairs = crossingPairs(p, n);
+    const pairs = crossingPairs(p, n).filter(([a, b]) => !baseline.has(a * n + b));
     if (!pairs.length) return;
     for (const [a, b] of pairs) {
       for (const c of [a, b]) {
@@ -109,8 +128,10 @@ export function wobble(p, n, amp, wavelength, seed, guard) {
  * 足りない分だけ押し広げ、押す量は前後になめらかに広げて線を自然に曲げる。
  * 元の位置から maxShift より遠くへは動かさない（離しすぎない）。
  */
-export function keepClearance(p, n, target, { step, iterations = 60, guard = true, maxShift = target * 2, rate = 3.5 } = {}) {
+export function keepClearance(p, n, target, { step, iterations = 60, guard = true, maxShift = target * 2, rate = 7, mobility = null } = {}) {
   if (target <= 0 || n < 4) return;
+  // 動かしやすさ: 近すぎる 2 点は、動きやすい側が多く動く。形をなす線はあまり動かさない
+  const mob = mobility || new Float32Array(n).fill(1);
   const orig = p.slice();
   const hits = new Float32Array(n);
   let best = p.slice(), bestViolations = Infinity;
@@ -148,10 +169,11 @@ export function keepClearance(p, n, target, { step, iterations = 60, guard = tru
             if (d2 >= t2) continue;
             violations++;
             const d = Math.sqrt(d2) || 1e-3;
-            const push = (target - d) / 2;
+            const need = target - d;
             const ux = d2 > 0 ? dx / d : 1, uy = d2 > 0 ? dy / d : 0;
-            disp[i * 2] += ux * push; disp[i * 2 + 1] += uy * push;
-            disp[j * 2] -= ux * push; disp[j * 2 + 1] -= uy * push;
+            const share = mob[i] / (mob[i] + mob[j]);
+            disp[i * 2] += ux * need * share; disp[i * 2 + 1] += uy * need * share;
+            disp[j * 2] -= ux * need * (1 - share); disp[j * 2 + 1] -= uy * need * (1 - share);
             hits[i]++; hits[j]++;
           }
         }
@@ -174,12 +196,19 @@ export function keepClearance(p, n, target, { step, iterations = 60, guard = tru
 
     const next = p.slice();
     for (let i = 0; i < n; i++) {
-      let x = p[i * 2] + disp[i * 2] * rate * 2, y = p[i * 2 + 1] + disp[i * 2 + 1] * rate * 2;
+      // なめらかに広げた押し量も、形をなす線の上では小さく
+      const m = mob[i];
+      const damp = 0.35 + 0.65 * m;
+      let x = p[i * 2] + disp[i * 2] * rate * damp, y = p[i * 2 + 1] + disp[i * 2 + 1] * rate * damp;
       // 押されていないところは少しずつ元の位置へ戻す
-      x += (orig[i * 2] - x) * 0.04;
-      y += (orig[i * 2 + 1] - y) * 0.04;
+      // 押されていないところは元の位置へ戻す（形をなす線ほど強く）
+      const back = 0.03 + 0.12 * (1 - m);
+      x += (orig[i * 2] - x) * back;
+      y += (orig[i * 2 + 1] - y) * back;
+      // 動ける範囲: 形をなす線は目標間隔の半分ほど、つなぎ線は maxShift まで
+      const lim = maxShift * (0.25 + 0.75 * m);
       const ox = x - orig[i * 2], oy = y - orig[i * 2 + 1], o = Math.hypot(ox, oy);
-      if (o > maxShift) { x = orig[i * 2] + (ox / o) * maxShift; y = orig[i * 2 + 1] + (oy / o) * maxShift; }
+      if (o > lim) { x = orig[i * 2] + (ox / o) * lim; y = orig[i * 2 + 1] + (oy / o) * lim; }
       next[i * 2] = x; next[i * 2 + 1] = y;
     }
     applyWithoutCrossing(p, next, n, guard);
@@ -216,16 +245,21 @@ function countClose(p, n, target, window, cell) {
   return c;
 }
 
-/** 角を丸める（ラプラシアン平滑化）。strength 0..1。 */
+/**
+ * 角を丸める。Taubin 平滑化（縮める一歩と膨らませる一歩を交互に）なので、
+ * 小さな輪（目・鼻など）が平滑化で縮んでしまわない。strength 0..1。
+ */
 export function smoothPath(p, n, strength, guard) {
   const rounds = Math.round(strength * 24);
   for (let r = 0; r < rounds; r++) {
-    const next = p.slice();
-    for (let i = 1; i < n - 1; i++) {
-      next[i * 2] = p[i * 2] + 0.5 * ((p[i * 2 - 2] + p[i * 2 + 2]) / 2 - p[i * 2]);
-      next[i * 2 + 1] = p[i * 2 + 1] + 0.5 * ((p[i * 2 - 1] + p[i * 2 + 3]) / 2 - p[i * 2 + 1]);
+    for (const f of [0.5, -0.53]) {
+      const next = p.slice();
+      for (let i = 1; i < n - 1; i++) {
+        next[i * 2] = p[i * 2] + f * ((p[i * 2 - 2] + p[i * 2 + 2]) / 2 - p[i * 2]);
+        next[i * 2 + 1] = p[i * 2 + 1] + f * ((p[i * 2 - 1] + p[i * 2 + 3]) / 2 - p[i * 2 + 1]);
+      }
+      applyWithoutCrossing(p, next, n, guard);
     }
-    applyWithoutCrossing(p, next, n, guard);
   }
 }
 
@@ -297,7 +331,7 @@ export function stylize(result, { hand = 0.5, gap = 2, strokeWidth = 1.6, smooth
   const n = p.length / 2;
   smoothPath(p, n, smooth, noCross);
   wobble(p, n, hand * 4, 110, seed, noCross);
-  keepClearance(p, n, target, { step, guard: noCross });
+  keepClearance(p, n, target, { step, guard: noCross, mobility: p.mobility });
   // 押し広げでできた小さな折れを軽くならす
   if (target > 0) smoothPath(p, n, 0.1, noCross);
   let length = 0;

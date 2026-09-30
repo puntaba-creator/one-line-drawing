@@ -78,7 +78,7 @@ test('線画モードは太い線を中心線にしてから点を置く', () =>
 test('spacing: auto は点数を maxPoints 付近に合わせる', () => {
   const img = circleImage(300, 300, 120, 1);
   for (const maxPoints of [80, 200]) {
-    const res = generateOneStroke(img, { mode: 'lines', maxPoints, optimizeMs: 50 });
+    const res = generateOneStroke(img, { mode: 'lines', route: 'tsp', maxPoints, optimizeMs: 50 });
     assert.ok(res.count <= maxPoints && res.count > maxPoints * 0.8, `${maxPoints}: ${res.count}`);
   }
 });
@@ -164,8 +164,11 @@ function flattenPath(d, steps) {
     i += 6;
     for (let s = 1; s <= steps; s++) {
       const u = s / steps, v = 1 - u;
-      out.push(v * v * v * x + 3 * v * v * u * a + 3 * v * u * u * e + u * u * u * g,
-        v * v * v * y + 3 * v * v * u * b + 3 * v * u * u * f + u * u * u * h);
+      const px = v * v * v * x + 3 * v * v * u * a + 3 * v * u * u * e + u * u * u * g;
+      const py = v * v * v * y + 3 * v * v * u * b + 3 * v * u * u * f + u * u * u * h;
+      // 制御点が端点と重なる曲線では同じ点が続くので、長さ 0 の区間は作らない
+      if (Math.hypot(px - out[out.length - 2], py - out[out.length - 1]) < 1e-6) continue;
+      out.push(px, py);
     }
     x = g; y = h;
   }

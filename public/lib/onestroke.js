@@ -1,4 +1,6 @@
 // 一筆書き生成のコアアルゴリズム（ブラウザ / Web Worker / Node で共通）
+
+import { chainRoute } from './chains.js';
 //
 // 画像 → 濃淡マップ → 描くべき点のサンプリング → 巡回セールスマン問題の近似解
 // （最近傍法 + 2-opt）で全点を1本の線でつなぐ → 最も長い区間を切って開いた線にする。
@@ -41,26 +43,37 @@ export function generateOneStroke(img, options = {}) {
 
   progress('analyze', 0);
   const ink = toInk(img, opt.invert);
-  const weight = weightMap(ink, width, height, opt.mode, opt.threshold);
+  const weight = weightMap(ink, width, height, opt.mode, opt.threshold, img);
 
-  progress('sample', 0);
-  const pts = opt.spacing === 'auto'
-    ? sampleAuto(weight, width, height, opt)
-    : samplePoints(weight, width, height, opt);
-  const n = pts.length / 2;
-  if (n < 2) {
-    return { points: pts, count: n, width, height, length: 0 };
+  // 輪郭・線画は線をひと続きのまま辿る。陰影（点描）は点の巡回路で描く
+  const route = opt.route || (opt.mode === 'shade' ? 'tsp' : 'chains');
+  let ordered, n;
+  if (route === 'chains') {
+    progress('route', 0);
+    const bin = new Uint8Array(width * height);
+    for (let i = 0; i < bin.length; i++) bin[i] = weight[i] > 0 ? 1 : 0;
+    thin(bin, width, height);
+    ordered = chainRoute(bin, width, height, { maxPoints: opt.maxPoints, budgetMs: opt.optimizeMs }).points;
+    n = ordered.length / 2;
+    if (n < 2) return { points: ordered, count: n, width, height, length: 0 };
+  } else {
+    progress('sample', 0);
+    const pts = opt.spacing === 'auto'
+      ? sampleAuto(weight, width, height, opt)
+      : samplePoints(weight, width, height, opt);
+    n = pts.length / 2;
+    if (n < 2) {
+      return { points: pts, count: n, width, height, length: 0 };
+    }
+    progress('route', 0);
+    const knn = buildNeighbors(pts, 10);
+    let tour = nearestNeighborTour(pts);
+    progress('route', 0.2);
+    twoOpt(pts, tour, knn, opt.optimizeMs, (r) => progress('route', 0.2 + 0.8 * r));
+    tour = openAtLongestEdge(pts, tour);
+    ordered = reorder(pts, tour);
+    if (opt.mode !== 'shade') relax(ordered, n);
   }
-
-  progress('route', 0);
-  const knn = buildNeighbors(pts, 10);
-  let tour = nearestNeighborTour(pts);
-  progress('route', 0.2);
-  twoOpt(pts, tour, knn, opt.optimizeMs, (r) => progress('route', 0.2 + 0.8 * r));
-  tour = openAtLongestEdge(pts, tour);
-
-  let ordered = reorder(pts, tour);
-  if (opt.mode !== 'shade') relax(ordered, n);
   if (opt.noCross) {
     // 平滑化で点が動いた後の最終的な座標で交差を解消する
     progress('uncross', 0);
@@ -125,24 +138,43 @@ function blur(src, w, h) {
   return out;
 }
 
-/** Sobel + 非最大値抑制で細い輪郭線の強度を得る（0..1）。 */
-export function edgeMap(ink, w, h) {
-  const g = blur(blur(ink, w, h), w, h);
+/** RGBA → R, G, B それぞれ 0..1 のチャンネル（透明部分は白い紙として合成）。 */
+export function toChannels(img) {
+  const { width, height, data } = img;
+  const ch = [0, 1, 2].map(() => new Float32Array(width * height));
+  for (let i = 0, p = 0; i < width * height; i++, p += 4) {
+    const a = data[p + 3] / 255;
+    for (let c = 0; c < 3; c++) ch[c][i] = (data[p + c] / 255) * a + (1 - a);
+  }
+  return ch;
+}
+
+/**
+ * Sobel + 非最大値抑制で細い輪郭線の強度を得る（0..1）。
+ * channels を複数渡すと、画素ごとに変化がいちばん大きいチャンネルを使う
+ * （明るさが同じでも色が違う境目 ― 空と肌色など ― を拾うため）。
+ */
+export function edgeMap(channels, w, h) {
+  if (!Array.isArray(channels)) channels = [channels];
   const mag = new Float32Array(w * h);
   const dir = new Uint8Array(w * h);
   let max = 1e-6;
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const gx = -g[i - w - 1] - 2 * g[i - 1] - g[i + w - 1] + g[i - w + 1] + 2 * g[i + 1] + g[i + w + 1];
-      const gy = -g[i - w - 1] - 2 * g[i - w] - g[i - w + 1] + g[i + w - 1] + 2 * g[i + w] + g[i + w + 1];
-      const m = Math.hypot(gx, gy);
-      mag[i] = m;
-      if (m > max) max = m;
-      // 勾配方向を 0°,45°,90°,135° に量子化
-      let a = Math.atan2(gy, gx) * 180 / Math.PI;
-      if (a < 0) a += 180;
-      dir[i] = a < 22.5 || a >= 157.5 ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : 3;
+  for (const ch of channels) {
+    const g = blur(blur(ch, w, h), w, h);
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        const gx = -g[i - w - 1] - 2 * g[i - 1] - g[i + w - 1] + g[i - w + 1] + 2 * g[i + 1] + g[i + w + 1];
+        const gy = -g[i - w - 1] - 2 * g[i - w] - g[i - w + 1] + g[i + w - 1] + 2 * g[i + w] + g[i + w + 1];
+        const m = Math.hypot(gx, gy);
+        if (m <= mag[i]) continue;
+        mag[i] = m;
+        if (m > max) max = m;
+        // 勾配方向を 0°,45°,90°,135° に量子化
+        let a = Math.atan2(gy, gx) * 180 / Math.PI;
+        if (a < 0) a += 180;
+        dir[i] = a < 22.5 || a >= 157.5 ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : 3;
+      }
     }
   }
   const out = new Float32Array(w * h);
@@ -162,14 +194,58 @@ export function edgeMap(ink, w, h) {
   return out;
 }
 
-/** モードごとに「その画素に点を置く確率」(0..1) を返す。 */
-export function weightMap(ink, w, h, mode, threshold) {
+/** 正方形の窓（半径 r）での最小値・最大値フィルタ（行と列に分けて計算）。 */
+function rankFilter(src, w, h, r, pick) {
+  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = src[y * w + x];
+      for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) v = pick(v, src[y * w + k]);
+      tmp[y * w + x] = v;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = tmp[y * w + x];
+      for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) v = pick(v, tmp[k * w + x]);
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * 細い線（幅がおよそ 2r+1 px 以下）の濃さ。トップハット変換: 元画像 − オープニング。
+ * 線の両側に輪郭が 2 本出てしまうのを防ぐため、細い線は中心線 1 本として扱う。
+ * 背景より暗い線と明るい線の両方を拾う。
+ */
+export function thinLineMap(ink, w, h, r = 3) {
+  const out = new Float32Array(w * h);
+  for (const src of [ink, ink.map((v) => 1 - v)]) {
+    const opened = rankFilter(rankFilter(src, w, h, r, Math.min), w, h, r, Math.max);
+    for (let i = 0; i < out.length; i++) out[i] = Math.max(out[i], src[i] - opened[i]);
+  }
+  return out;
+}
+
+/** モードごとに「その画素に点を置く確率」(0..1) を返す。img を渡すと輪郭モードで色の境目も使う。 */
+export function weightMap(ink, w, h, mode, threshold, img = null) {
   const out = new Float32Array(w * h);
   if (mode === 'edges') {
-    const e = edgeMap(ink, w, h);
+    const e = edgeMap(img ? [ink, ...toChannels(img)] : [ink], w, h);
     // しきい値 0..1 をエッジ強度 0.02..0.5 に対応づける
     const t = 0.02 + threshold * 0.48;
-    for (let i = 0; i < out.length; i++) out[i] = e[i] >= t ? 1 : 0;
+    // 細い線は中心線にし、その周り（線の両側の輪郭）は使わない
+    const R = 3;
+    const lineStrength = thinLineMap(ink, w, h, R);
+    const line = new Uint8Array(w * h);
+    const tl = 0.12 + threshold * 0.4;
+    for (let i = 0; i < out.length; i++) line[i] = lineStrength[i] >= tl ? 1 : 0;
+    thin(line, w, h);
+    // 形の角や先端がたまたま細く見えただけの短い切れ端は線として扱わない
+    dropSmallComponents(line, w, h, 12);
+    const near = rankFilter(Float32Array.from(line), w, h, R, Math.max);
+    for (let i = 0; i < out.length; i++) out[i] = line[i] ? 1 : near[i] ? 0 : e[i] >= t ? 1 : 0;
   } else if (mode === 'lines') {
     const t = 0.1 + threshold * 0.8;
     const bin = new Uint8Array(w * h);
@@ -189,6 +265,29 @@ export function weightMap(ink, w, h, mode, threshold) {
     }
   }
   return out;
+}
+
+/** 8 連結で画素数が minSize 未満のかたまりを消す（その場で書き換え）。 */
+export function dropSmallComponents(bin, w, h, minSize) {
+  const seen = new Uint8Array(w * h);
+  const stack = [], comp = [];
+  for (let i = 0; i < bin.length; i++) {
+    if (!bin[i] || seen[i]) continue;
+    stack.push(i); seen[i] = 1; comp.length = 0;
+    while (stack.length) {
+      const c = stack.pop();
+      comp.push(c);
+      const x = c % w, y = (c / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const j = ny * w + nx;
+        if (bin[j] && !seen[j]) { seen[j] = 1; stack.push(j); }
+      }
+    }
+    if (comp.length < minSize) for (const c of comp) bin[c] = 0;
+  }
+  return bin;
 }
 
 /** Zhang–Suen 細線化（その場で書き換え）。 */
@@ -711,6 +810,15 @@ function curveGeometry(points, count, scale, tension) {
 export function safeTensions(points, count, smooth, scale = 1) {
   const tension = new Float32Array(Math.max(0, count - 1)).fill(smooth / 6);
   if (smooth <= 0 || count < 3) return tension;
+  // 制御点が弦の方向に「始点 → c1 → c2 → 終点」の順に並ばない区間は直線にする。
+  // この順に並んでいれば曲線は弦方向に単調に進むので、それ自身と重なることはない
+  const pre = curveGeometry(points, count, scale, (i) => tension[i]);
+  for (let i = 0; i < count - 1; i++) {
+    const [x0, y0, c1x, c1y, c2x, c2y, x3, y3] = pre.subarray(i * 8, i * 8 + 8);
+    const cx = x3 - x0, cy = y3 - y0, L2 = cx * cx + cy * cy;
+    const t1 = (c1x - x0) * cx + (c1y - y0) * cy, t2 = (c2x - x0) * cx + (c2y - y0) * cy;
+    if (!(0 <= t1 && t1 <= t2 && t2 <= L2)) tension[i] = 0;
+  }
   for (let round = 0; round < 50; round++) {
     const geo = curveGeometry(points, count, scale, (i) => tension[i]);
     const flat = new Float32Array(((count - 1) * CURVE_STEPS + 1) * 2);
