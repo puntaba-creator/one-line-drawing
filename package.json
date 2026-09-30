@@ -1,0 +1,17 @@
+{
+  "name": "one-line-drawing",
+  "version": "0.1.0",
+  "description": "写真・イラスト・文章から一筆書きの画像を生成するWebサービス",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.130.0"
+  }
+}

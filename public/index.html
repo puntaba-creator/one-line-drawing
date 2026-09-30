@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>一筆書きメーカー</title>
+  <meta name="description" content="写真・イラスト・文章から、一本の線だけで描いた絵を作ります。">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M4 24C8 4 14 30 18 14s8 4 10-6' fill='none' stroke='%23222' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <svg class="logo" viewBox="0 0 64 32" aria-hidden="true"><path d="M4 24C10 2 18 30 26 14S38 4 42 18s10 8 18-10" /></svg>
+    <div>
+      <h1>一筆書きメーカー</h1>
+      <p class="tagline">写真・イラスト・文章を、途切れない一本の線で描き直します。</p>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel input-panel" aria-label="入力">
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true" data-tab="image">写真・イラスト</button>
+        <button role="tab" aria-selected="false" data-tab="text">文字</button>
+        <button role="tab" aria-selected="false" data-tab="ai">文章から絵</button>
+      </div>
+
+      <div class="tab-body" data-body="image">
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file" accept="image/*" hidden>
+          <span class="dz-main">画像をドロップ、またはクリックして選択</span>
+          <span class="dz-sub">貼り付け（Ctrl/⌘+V）でもOK。画像はブラウザ内だけで処理されます。</span>
+        </label>
+        <button class="link-btn" id="sample-btn" type="button">サンプル画像で試す</button>
+      </div>
+
+      <div class="tab-body" data-body="text" hidden>
+        <label class="field">
+          <span>描く文字</span>
+          <textarea id="text-input" rows="2" maxlength="40">ありがとう</textarea>
+        </label>
+        <label class="field">
+          <span>書体</span>
+          <select id="font-select">
+            <option value="sans">ゴシック</option>
+            <option value="serif">明朝</option>
+            <option value="rounded">丸ゴシック</option>
+            <option value="cursive">筆記体（欧文）</option>
+          </select>
+        </label>
+        <button class="primary" id="text-go" type="button">この文字で描く</button>
+      </div>
+
+      <div class="tab-body" data-body="ai" hidden>
+        <label class="field">
+          <span>描きたいものを文章で</span>
+          <textarea id="ai-input" rows="3" maxlength="300" placeholder="例：自転車に乗る猫 / 富士山と桜 / コーヒーカップから湯気"></textarea>
+        </label>
+        <button class="primary" id="ai-go" type="button">AIで下絵を作って描く</button>
+        <p class="hint">AI（Claude）が線画の下絵を作り、それを一筆書きにします。30秒ほどかかることがあります。</p>
+      </div>
+
+      <figure class="source" id="source-figure" hidden>
+        <canvas id="source-canvas"></canvas>
+        <figcaption>元画像</figcaption>
+      </figure>
+
+      <details class="settings" open>
+        <summary>描き方の設定</summary>
+        <div class="field">
+          <span>スタイル</span>
+          <div class="segmented" id="mode">
+            <label><input type="radio" name="mode" value="edges" checked><span>輪郭</span></label>
+            <label><input type="radio" name="mode" value="lines"><span>線画</span></label>
+            <label><input type="radio" name="mode" value="shade"><span>陰影</span></label>
+          </div>
+          <small class="mode-help" id="mode-help"></small>
+        </div>
+        <label class="field range">
+          <span>細かさ <output id="detail-out"></output></span>
+          <input type="range" id="detail" min="300" max="8000" step="100" value="2500">
+        </label>
+        <label class="field range">
+          <span>拾う線のしきい値 <output id="threshold-out"></output></span>
+          <input type="range" id="threshold" min="0" max="1" step="0.01" value="0.25">
+        </label>
+        <label class="field range">
+          <span>なめらかさ <output id="smooth-out"></output></span>
+          <input type="range" id="smooth" min="0" max="1" step="0.05" value="0.6">
+        </label>
+        <label class="field range">
+          <span>線の太さ <output id="width-out"></output></span>
+          <input type="range" id="stroke-width" min="0.5" max="6" step="0.1" value="1.6">
+        </label>
+        <div class="field colors">
+          <label>線の色 <input type="color" id="stroke-color" value="#1f1d1a"></label>
+          <label>背景 <input type="color" id="bg-color" value="#fbf8f1"></label>
+          <label class="check"><input type="checkbox" id="bg-transparent"> 透明</label>
+        </div>
+      </details>
+    </section>
+
+    <section class="panel output-panel" aria-label="結果">
+      <div class="stage" id="stage">
+        <div class="placeholder" id="placeholder">
+          <svg viewBox="0 0 200 120" aria-hidden="true"><path d="M10 90C30 20 60 20 70 60s30 40 40 0 20-50 40-20 20 40 40 10" /></svg>
+          <p>左で画像や文字を選ぶと、ここに一筆書きが描かれます。</p>
+        </div>
+        <div class="svg-holder" id="svg-holder"></div>
+        <div class="busy" id="busy" hidden>
+          <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+          <p id="busy-label">解析中…</p>
+        </div>
+      </div>
+      <p class="stats" id="stats"></p>
+      <p class="error" id="error" role="alert" hidden></p>
+      <div class="actions">
+        <button type="button" id="replay" disabled>描く様子を再生</button>
+        <button type="button" id="dl-svg" disabled>SVG で保存</button>
+        <button type="button" id="dl-png" disabled>PNG で保存</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    写真・文字の処理はすべてお使いのブラウザ内で行われ、サーバーには送信されません。「文章から絵」だけが入力文をサーバー経由で AI に送ります。
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
