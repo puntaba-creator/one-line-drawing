@@ -157,3 +157,8 @@ input[type="color"] { width: 36px; height: 28px; border: 1px solid var(--line); 
 @media (max-width: 420px) {
   .tabs button { font-size: .8rem; white-space: nowrap; }
 }
+
+.check-field { flex-direction: row; align-items: flex-start; gap: 8px; cursor: pointer; }
+.check-field input { margin-top: 5px; accent-color: var(--accent); }
+.check-field > span { flex-direction: column; justify-content: flex-start; }
+.check-field small { font-weight: 400; color: var(--ink-soft); font-size: .78rem; }

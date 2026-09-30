@@ -1,4 +1,4 @@
-import { toSvg } from './lib/onestroke.js';
+import { toSvg, safeTensions } from './lib/onestroke.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +23,7 @@ const FONTS = {
 const state = {
   source: null, // { width, height, data } 解析用の画像
   result: null, // 一筆書きの点列
+  tensions: null, // 交差しない曲線にするための区間ごとの曲がり具合 { smooth, values }
   jobId: 0,
 };
 
@@ -34,10 +35,11 @@ worker.onmessage = (e) => {
   const msg = e.data;
   if (msg.id !== state.jobId) return; // 古いジョブの結果は捨てる
   if (msg.type === 'progress') {
-    const label = { analyze: '画像を解析中…', sample: '線をたどる点を配置中…', route: '一本の線でつなぎ中…', done: '仕上げ中…' }[msg.stage];
+    const label = { analyze: '画像を解析中…', sample: '線をたどる点を配置中…', route: '一本の線でつなぎ中…', uncross: '交差をほどいています…', done: '仕上げ中…' }[msg.stage];
     setBusy(label, msg.stage === 'route' ? msg.ratio : null);
   } else if (msg.type === 'result') {
-    state.result = msg.result;
+    state.result = { ...msg.result, noCross: settings().noCross };
+    state.tensions = null;
     setBusy(null);
     render(true);
   } else if (msg.type === 'error') {
@@ -49,6 +51,7 @@ worker.onmessage = (e) => {
 function settings() {
   return {
     mode: document.querySelector('input[name="mode"]:checked').value,
+    noCross: $('no-cross').checked,
     maxPoints: Number($('detail').value),
     threshold: Number($('threshold').value),
     smooth: Number($('smooth').value),
@@ -73,6 +76,7 @@ function generate() {
       mode: s.mode,
       maxPoints: s.maxPoints,
       threshold: s.threshold,
+      noCross: s.noCross,
       // 点が多いほど経路最適化に時間をかける
       optimizeMs: Math.min(4000, 600 + s.maxPoints * 0.4),
     },
@@ -84,7 +88,13 @@ function generate() {
 
 function buildSvg() {
   const s = settings();
-  return toSvg(state.result, {
+  const r = state.result;
+  // 曲線化で生まれる交差を避ける（なめらかさが変わったときだけ計算し直す）
+  if (r.noCross && s.smooth > 0 && state.tensions?.smooth !== s.smooth) {
+    state.tensions = { smooth: s.smooth, values: safeTensions(r.points, r.count, s.smooth, OUTPUT_SCALE) };
+  }
+  return toSvg(r, {
+    tensions: r.noCross && s.smooth > 0 ? state.tensions.values : null,
     scale: OUTPUT_SCALE,
     smooth: s.smooth,
     stroke: s.stroke,
@@ -107,7 +117,7 @@ function render(animate = false) {
   // buildSvg は数値と検証済みの色だけから組み立てるので innerHTML で安全
   $('svg-holder').innerHTML = buildSvg();
   const ratio = r.length / r.width;
-  $('stats').textContent = `${r.count.toLocaleString()} 点を 1 本の線でつなぎました（線の長さは画像の幅の約 ${Math.round(ratio)} 倍）`;
+  $('stats').textContent = `${r.count.toLocaleString()} 点を${r.noCross ? '交差なしの' : ''} 1 本の線でつなぎました（線の長さは画像の幅の約 ${Math.round(ratio)} 倍）`;
   setActions(true);
   if (animate) playDrawing();
 }
@@ -321,6 +331,7 @@ for (const input of document.querySelectorAll('input[name="mode"]')) {
   input.addEventListener('change', () => { setMode(input.value); generate(); });
 }
 $('detail').addEventListener('input', regenerate);
+$('no-cross').addEventListener('change', generate);
 $('threshold').addEventListener('input', regenerate);
 
 // 見た目だけの設定（再計算なし）

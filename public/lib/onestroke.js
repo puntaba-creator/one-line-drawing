@@ -12,6 +12,7 @@
  *   spacing?: number | 'auto', // 点同士の最小間隔（px）。auto なら点数が maxPoints に近づくよう調整
  *   invert?: 'auto' | boolean,
  *   optimizeMs?: number,  // 2-opt に使う時間
+ *   noCross?: boolean,    // 線同士が交差しないように仕上げる
  *   seed?: number,
  *   onProgress?: (stage: string, ratio: number) => void,
  * }} Options
@@ -24,6 +25,7 @@ export const DEFAULTS = {
   spacing: 'auto',
   invert: 'auto',
   optimizeMs: 1500,
+  noCross: true,
   seed: 1,
 };
 
@@ -57,16 +59,28 @@ export function generateOneStroke(img, options = {}) {
   twoOpt(pts, tour, knn, opt.optimizeMs, (r) => progress('route', 0.2 + 0.8 * r));
   tour = openAtLongestEdge(pts, tour);
 
-  const ordered = new Float32Array(n * 2);
-  let length = 0;
-  for (let i = 0; i < n; i++) {
-    ordered[i * 2] = pts[tour[i] * 2];
-    ordered[i * 2 + 1] = pts[tour[i] * 2 + 1];
-    if (i > 0) length += Math.hypot(ordered[i * 2] - ordered[i * 2 - 2], ordered[i * 2 + 1] - ordered[i * 2 - 1]);
-  }
+  let ordered = reorder(pts, tour);
   if (opt.mode !== 'shade') relax(ordered, n);
+  if (opt.noCross) {
+    // 平滑化で点が動いた後の最終的な座標で交差を解消する
+    progress('uncross', 0);
+    const order = Int32Array.from({ length: n }, (_, i) => i);
+    uncross(ordered, order);
+    ordered = reorder(ordered, order);
+  }
+  let length = 0;
+  for (let i = 1; i < n; i++) length += Math.hypot(ordered[i * 2] - ordered[i * 2 - 2], ordered[i * 2 + 1] - ordered[i * 2 - 1]);
   progress('done', 1);
   return { points: ordered, count: n, width, height, length };
+}
+
+function reorder(p, tour) {
+  const out = new Float32Array(tour.length * 2);
+  for (let i = 0; i < tour.length; i++) {
+    out[i * 2] = p[tour[i] * 2];
+    out[i * 2 + 1] = p[tour[i] * 2 + 1];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +511,164 @@ export function openAtLongestEdge(p, tour) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// 交差の解消
+
+function orient(p, a, b, c) {
+  return (p[b * 2] - p[a * 2]) * (p[c * 2 + 1] - p[a * 2 + 1]) - (p[b * 2 + 1] - p[a * 2 + 1]) * (p[c * 2] - p[a * 2]);
+}
+
+function onSegment(p, a, b, c) {
+  // c が線分 ab の範囲内（a,b,c が同一直線上である前提）
+  return Math.min(p[a * 2], p[b * 2]) <= p[c * 2] && p[c * 2] <= Math.max(p[a * 2], p[b * 2]) &&
+    Math.min(p[a * 2 + 1], p[b * 2 + 1]) <= p[c * 2 + 1] && p[c * 2 + 1] <= Math.max(p[a * 2 + 1], p[b * 2 + 1]);
+}
+
+/** 線分 ab と cd が交わる・接する・重なるか（端点を共有する組は呼び出し側で除く）。 */
+export function segmentsIntersect(p, a, b, c, d) {
+  const o1 = orient(p, a, b, c), o2 = orient(p, a, b, d);
+  const o3 = orient(p, c, d, a), o4 = orient(p, c, d, b);
+  if (((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0))) return true;
+  return (o1 === 0 && onSegment(p, a, b, c)) || (o2 === 0 && onSegment(p, a, b, d)) ||
+    (o3 === 0 && onSegment(p, c, d, a)) || (o4 === 0 && onSegment(p, c, d, b));
+}
+
+/** 線分が通過するグリッドのセルを列挙する（Amanatides–Woo のボクセル走査）。 */
+function traverseCells(x0, y0, x1, y1, g, out) {
+  out.length = 0;
+  let cx = Math.floor((x0 - g.minX) / g.cell), cy = Math.floor((y0 - g.minY) / g.cell);
+  const ex = Math.floor((x1 - g.minX) / g.cell), ey = Math.floor((y1 - g.minY) / g.cell);
+  const dx = x1 - x0, dy = y1 - y0;
+  const sx = Math.sign(dx), sy = Math.sign(dy);
+  const tdx = dx !== 0 ? Math.abs(g.cell / dx) : Infinity;
+  const tdy = dy !== 0 ? Math.abs(g.cell / dy) : Infinity;
+  let tx = dx !== 0 ? ((sx > 0 ? cx + 1 : cx) * g.cell + g.minX - x0) / dx : Infinity;
+  let ty = dy !== 0 ? ((sy > 0 ? cy + 1 : cy) * g.cell + g.minY - y0) / dy : Infinity;
+  const steps = Math.abs(ex - cx) + Math.abs(ey - cy);
+  out.push(cy * g.gw + cx);
+  for (let s = 0; s < steps; s++) {
+    if (tx < ty) { cx += sx; tx += tdx; } else { cy += sy; ty += tdy; }
+    if (cx < 0 || cy < 0 || cx >= g.gw || cy >= g.gh) break;
+    out.push(cy * g.gw + cx);
+  }
+  return out;
+}
+
+function segmentGrid(p, n) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    minX = Math.min(minX, p[i * 2]); maxX = Math.max(maxX, p[i * 2]);
+    minY = Math.min(minY, p[i * 2 + 1]); maxY = Math.max(maxY, p[i * 2 + 1]);
+  }
+  // セルの境界ちょうどの交点を取りこぼさないよう少し広げる
+  minX -= 1; minY -= 1; maxX += 1; maxY += 1;
+  const cell = Math.max(1, Math.sqrt(((maxX - minX) * (maxY - minY)) / n) * 2);
+  const gw = Math.floor((maxX - minX) / cell) + 1, gh = Math.floor((maxY - minY) / cell) + 1;
+  return { minX, minY, cell, gw, gh, cells: new Map() };
+}
+
+/**
+ * 開いた経路 tour（p の点番号の並び）から交差・接触・重なりをなくす。
+ * 交わる 2 辺 (A,B), (C,D) を (A,C), (B,D) につなぎ替えると経路は必ず短くなるので、
+ * 交差がなくなるまで繰り返しても必ず終わる。tour をその場で書き換え、つなぎ替え回数を返す。
+ */
+export function uncross(p, tour) {
+  const n = tour.length;
+  if (n < 4) return 0;
+  const N = n + 1;
+  const pos = new Int32Array(p.length / 2);
+  for (let i = 0; i < n; i++) pos[tour[i]] = i;
+  const g = segmentGrid(p, p.length / 2);
+  const segCells = new Map();
+  const tmp = [];
+  const keyOf = (a, b) => (a < b ? a * N + b : b * N + a);
+
+  const add = (a, b) => {
+    const key = keyOf(a, b);
+    const cells = traverseCells(p[a * 2], p[a * 2 + 1], p[b * 2], p[b * 2 + 1], g, tmp).slice();
+    segCells.set(key, cells);
+    for (const c of cells) {
+      let set = g.cells.get(c);
+      if (!set) g.cells.set(c, (set = new Set()));
+      set.add(key);
+    }
+    return key;
+  };
+  const remove = (a, b) => {
+    const key = keyOf(a, b);
+    for (const c of segCells.get(key)) g.cells.get(c).delete(key);
+    segCells.delete(key);
+  };
+
+  const queue = [];
+  for (let i = 0; i + 1 < n; i++) queue.push(add(tour[i], tour[i + 1]));
+
+  let fixes = 0;
+  const maxFixes = n * 50; // 数値誤差による無限ループ対策
+  while (queue.length && fixes < maxFixes) {
+    const key = queue.pop();
+    const cells = segCells.get(key);
+    if (!cells) continue; // すでにつなぎ替えで消えた辺
+    const a = Math.floor(key / N), b = key % N;
+    let fixed = false;
+    for (const cell of cells) {
+      for (const other of g.cells.get(cell)) {
+        if (other === key) continue;
+        const c = Math.floor(other / N), d = other % N;
+        if (c === a || c === b || d === a || d === b) continue;
+        if (!segmentsIntersect(p, a, b, c, d)) continue;
+        let i = Math.min(pos[a], pos[b]), j = Math.min(pos[c], pos[d]);
+        if (i > j) { const t = i; i = j; j = t; }
+        const A = tour[i], B = tour[i + 1], C = tour[j], D = tour[j + 1];
+        // 真の交差なら必ず短くなる。接触・重なりは短くなる場合だけ直す
+        if (dist(p, A, C) + dist(p, B, D) - dist(p, A, B) - dist(p, C, D) > -1e-9) continue;
+        remove(A, B);
+        remove(C, D);
+        for (let s = i + 1, e = j; s < e; s++, e--) {
+          const t = tour[s]; tour[s] = tour[e]; tour[e] = t;
+          pos[tour[s]] = s; pos[tour[e]] = e;
+        }
+        queue.push(add(A, C), add(B, D));
+        fixes++;
+        fixed = true;
+        break;
+      }
+      if (fixed) break;
+    }
+  }
+  return fixes;
+}
+
+/** 開いた折れ線 points[0..count) の中で交わっている辺の組 [i, j]（隣り合う辺は除く）。 */
+export function crossingPairs(points, count) {
+  const pairs = [];
+  if (count < 4) return pairs;
+  const order = Int32Array.from({ length: count }, (_, i) => i);
+  const g = segmentGrid(points, count);
+  const tmp = [];
+  for (let i = 0; i + 1 < count; i++) {
+    const cells = traverseCells(points[i * 2], points[i * 2 + 1], points[i * 2 + 2], points[i * 2 + 3], g, tmp);
+    const seen = new Set();
+    for (const c of cells) {
+      for (const j of g.cells.get(c) || []) {
+        if (seen.has(j) || j >= i - 1) continue;
+        seen.add(j);
+        if (segmentsIntersect(points, order[i], order[i + 1], order[j], order[j + 1])) pairs.push([j, i]);
+      }
+    }
+    for (const c of cells) {
+      let set = g.cells.get(c);
+      if (!set) g.cells.set(c, (set = new Set()));
+      set.add(i);
+    }
+  }
+  return pairs;
+}
+
+export function countCrossings(points, count) {
+  return crossingPairs(points, count).length;
+}
+
 export function tourLength(p, tour, closed = false) {
   let s = 0;
   for (let i = 0; i + 1 < tour.length; i++) s += dist(p, tour[i], tour[i + 1]);
@@ -507,33 +679,85 @@ export function tourLength(p, tour, closed = false) {
 // ---------------------------------------------------------------------------
 // SVG 出力
 
+const CURVE_STEPS = 16;
+const round1 = (v) => Math.round(v * 10) / 10;
+
+/**
+ * SVG に書き出すのと同じ（丸め済みの）幾何を作る。
+ * 区間 i は [x0, y0, c1x, c1y, c2x, c2y, x3, y3]。直線区間は制御点を両端に置く。
+ */
+function curveGeometry(points, count, scale, tension) {
+  const X = (k) => round1(points[k * 2] * scale), Y = (k) => round1(points[k * 2 + 1] * scale);
+  const g = new Float64Array(Math.max(0, count - 1) * 8);
+  for (let i = 0; i < count - 1; i++) {
+    const t = tension(i);
+    const x0 = X(i), y0 = Y(i), x3 = X(i + 1), y3 = Y(i + 1);
+    let c1x = x0, c1y = y0, c2x = x3, c2y = y3;
+    if (t !== 0) {
+      const i0 = Math.max(0, i - 1), i3 = Math.min(count - 1, i + 2);
+      c1x = round1(x0 + (x3 - X(i0)) * t); c1y = round1(y0 + (y3 - Y(i0)) * t);
+      c2x = round1(x3 - (X(i3) - x0) * t); c2y = round1(y3 - (Y(i3) - y0) * t);
+    }
+    g.set([x0, y0, c1x, c1y, c2x, c2y, x3, y3], i * 8);
+  }
+  return g;
+}
+
+/**
+ * 曲線化しても交差しないよう、区間ごとの曲がり具合を決める。
+ * 曲線にしたことで交わった区間は直線に戻す（全区間が直線なら元の折れ線と同じで交差はない）。
+ * scale は書き出し時と同じ値を渡す（丸め誤差まで含めて同じ形で判定するため）。
+ */
+export function safeTensions(points, count, smooth, scale = 1) {
+  const tension = new Float32Array(Math.max(0, count - 1)).fill(smooth / 6);
+  if (smooth <= 0 || count < 3) return tension;
+  for (let round = 0; round < 50; round++) {
+    const geo = curveGeometry(points, count, scale, (i) => tension[i]);
+    const flat = new Float32Array(((count - 1) * CURVE_STEPS + 1) * 2);
+    flat[0] = geo[0]; flat[1] = geo[1];
+    let k = 2;
+    for (let i = 0; i < count - 1; i++) {
+      const [x0, y0, c1x, c1y, c2x, c2y, x3, y3] = geo.subarray(i * 8, i * 8 + 8);
+      for (let s = 1; s <= CURVE_STEPS; s++) {
+        const u = s / CURVE_STEPS, v = 1 - u;
+        flat[k++] = v * v * v * x0 + 3 * v * v * u * c1x + 3 * v * u * u * c2x + u * u * u * x3;
+        flat[k++] = v * v * v * y0 + 3 * v * v * u * c1y + 3 * v * u * u * c2y + u * u * u * y3;
+      }
+    }
+    const pairs = crossingPairs(flat, flat.length / 2);
+    if (!pairs.length) break;
+    let changed = false;
+    for (const [a, b] of pairs) {
+      for (const seg of [Math.floor(a / CURVE_STEPS), Math.floor(b / CURVE_STEPS)]) {
+        if (tension[seg] !== 0) { tension[seg] = 0; changed = true; }
+      }
+    }
+    if (!changed) break;
+  }
+  return tension;
+}
+
 /**
  * 並んだ点列を SVG の path データに変換する。
  * smooth=0 で折れ線、>0 で Catmull-Rom スプラインによる曲線。
+ * tensions を渡すと区間ごとの曲がり具合をそれで決める（safeTensions の結果）。
  */
-export function toPathData(points, count, scale = 1, smooth = 0.5) {
+export function toPathData(points, count, scale = 1, smooth = 0.5, tensions = null) {
   if (count === 0) return '';
-  const X = (i) => points[i * 2] * scale, Y = (i) => points[i * 2 + 1] * scale;
-  const f = (v) => Math.round(v * 10) / 10;
-  let d = `M${f(X(0))} ${f(Y(0))}`;
-  if (smooth <= 0) {
-    for (let i = 1; i < count; i++) d += `L${f(X(i))} ${f(Y(i))}`;
-    return d;
-  }
-  const t = smooth / 6;
+  const geo = curveGeometry(points, count, scale, (i) => (smooth <= 0 ? 0 : tensions ? tensions[i] : smooth / 6));
+  let d = `M${round1(points[0] * scale)} ${round1(points[1] * scale)}`;
   for (let i = 0; i < count - 1; i++) {
-    const i0 = Math.max(0, i - 1), i2 = i + 1, i3 = Math.min(count - 1, i + 2);
-    const c1x = X(i) + (X(i2) - X(i0)) * t, c1y = Y(i) + (Y(i2) - Y(i0)) * t;
-    const c2x = X(i2) - (X(i3) - X(i)) * t, c2y = Y(i2) - (Y(i3) - Y(i)) * t;
-    d += `C${f(c1x)} ${f(c1y)} ${f(c2x)} ${f(c2y)} ${f(X(i2))} ${f(Y(i2))}`;
+    const [, , c1x, c1y, c2x, c2y, x3, y3] = geo.subarray(i * 8, i * 8 + 8);
+    const straight = c1x === geo[i * 8] && c1y === geo[i * 8 + 1] && c2x === x3 && c2y === y3;
+    d += straight ? `L${x3} ${y3}` : `C${c1x} ${c1y} ${c2x} ${c2y} ${x3} ${y3}`;
   }
   return d;
 }
 
 export function toSvg({ points, count, width, height }, style = {}) {
-  const { scale = 1, smooth = 0.5, stroke = '#111111', strokeWidth = 1.5, background = '#ffffff' } = style;
+  const { scale = 1, smooth = 0.5, stroke = '#111111', strokeWidth = 1.5, background = '#ffffff', tensions = null } = style;
   const W = Math.round(width * scale), H = Math.round(height * scale);
   const bg = background && background !== 'transparent' ? `<rect width="100%" height="100%" fill="${background}"/>` : '';
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">${bg}` +
-    `<path d="${toPathData(points, count, scale, smooth)}" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    `<path d="${toPathData(points, count, scale, smooth, tensions)}" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }

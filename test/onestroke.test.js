@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   generateOneStroke, samplePoints, buildNeighbors, nearestNeighborTour, twoOpt, tourLength, toSvg,
+  uncross, countCrossings, segmentsIntersect, safeTensions,
 } from '../public/lib/onestroke.js';
 
 /** 白地に黒い円を描いたテスト画像 */
@@ -81,3 +82,92 @@ test('spacing: auto は点数を maxPoints 付近に合わせる', () => {
     assert.ok(res.count <= maxPoints && res.count > maxPoints * 0.8, `${maxPoints}: ${res.count}`);
   }
 });
+
+/** 総当たりで交差（接触・重なり含む）している辺の組を数える */
+function bruteCrossings(pts, count) {
+  const idx = Int32Array.from({ length: count }, (_, i) => i);
+  let c = 0;
+  for (let i = 0; i + 1 < count; i++) {
+    for (let j = i + 2; j + 1 < count; j++) {
+      if (segmentsIntersect(pts, idx[i], idx[i + 1], idx[j], idx[j + 1])) c++;
+    }
+  }
+  return c;
+}
+
+test('uncross はランダムな経路の交差をすべてなくし、全点を保つ', () => {
+  const rand = (() => { let s = 3; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
+  const n = 400;
+  const pts = new Float32Array(n * 2).map(() => rand() * 300);
+  const tour = Int32Array.from({ length: n }, (_, i) => i); // ランダム順＝交差だらけ
+  assert.ok(bruteCrossings(reorderForTest(pts, tour), n) > 1000);
+  uncross(pts, tour);
+  const out = reorderForTest(pts, tour);
+  assert.equal(bruteCrossings(out, n), 0);
+  assert.equal(countCrossings(out, n), 0);
+  assert.equal(new Set(tour).size, n);
+});
+
+function reorderForTest(pts, tour) {
+  const out = new Float32Array(tour.length * 2);
+  tour.forEach((t, i) => { out[i * 2] = pts[t * 2]; out[i * 2 + 1] = pts[t * 2 + 1]; });
+  return out;
+}
+
+test('countCrossings は総当たりと一致する', () => {
+  const rand = (() => { let s = 11; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
+  const n = 300;
+  const pts = new Float32Array(n * 2).map(() => rand() * 200);
+  assert.equal(countCrossings(pts, n), bruteCrossings(pts, n));
+});
+
+test('全モードで生成結果に交差がない', () => {
+  // 円と十字を重ねた画像（交差しやすい形）
+  const img = circleImage(200, 200, 70, 2);
+  for (let y = 0; y < 200; y++) for (let x = 0; x < 200; x++) {
+    if (Math.abs(x - 100) < 2 || Math.abs(y - 100) < 2 || Math.abs(x - y) < 2) {
+      const p = (y * 200 + x) * 4; img.data[p] = img.data[p + 1] = img.data[p + 2] = 0;
+    }
+  }
+  for (const mode of ['edges', 'lines', 'shade']) {
+    const res = generateOneStroke(img, { mode, maxPoints: 1500, optimizeMs: 100 });
+    assert.equal(bruteCrossings(res.points, res.count), 0, mode);
+  }
+});
+
+test('曲線化して書き出した SVG も交差しない', () => {
+  const img = circleImage(200, 200, 70, 2);
+  for (let y = 0; y < 200; y++) for (let x = 0; x < 200; x++) {
+    if (Math.abs(x - y) < 2 || Math.abs(x + y - 200) < 2) {
+      const p = (y * 200 + x) * 4; img.data[p] = img.data[p + 1] = img.data[p + 2] = 0;
+    }
+  }
+  for (const mode of ['edges', 'lines', 'shade']) {
+    const res = generateOneStroke(img, { mode, maxPoints: 1500, optimizeMs: 100 });
+    for (const smooth of [0.6, 1]) {
+      const svg = toSvg(res, { scale: 2, smooth, tensions: safeTensions(res.points, res.count, smooth, 2) });
+      const flat = flattenPath(svg.match(/ d="([^"]+)"/)[1], 48);
+      assert.equal(countCrossings(flat, flat.length / 2), 0, `${mode} smooth=${smooth}`);
+    }
+  }
+});
+
+/** SVG の path（M/L/C のみ）を細かい折れ線にする */
+function flattenPath(d, steps) {
+  const tok = d.match(/[MLC]|-?[\d.]+/g);
+  const out = [];
+  let x = 0, y = 0;
+  for (let i = 0; i < tok.length;) {
+    const c = tok[i++];
+    if (c !== 'C') { x = +tok[i++]; y = +tok[i++]; out.push(x, y); continue; }
+    const [a, b, e, f, g, h] = tok.slice(i, i + 6).map(Number);
+    i += 6;
+    for (let s = 1; s <= steps; s++) {
+      const u = s / steps, v = 1 - u;
+      out.push(v * v * v * x + 3 * v * v * u * a + 3 * v * u * u * e + u * u * u * g,
+        v * v * v * y + 3 * v * v * u * b + 3 * v * u * u * f + u * u * u * h);
+    }
+    x = g; y = h;
+  }
+  return new Float32Array(out);
+}
